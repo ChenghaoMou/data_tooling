@@ -1,9 +1,11 @@
 #!/bin/bash
-LANGUAGES=('gl')
-SHARDS=20
+LANGUAGES=('fr')
+SHARDS=64
 THRESHOLD=3
-PYTHON="/home/jovyan/conda/envs/data/bin/python"
-SCRIPT="/home/jovyan/data_tooling/ac_dc/deduplicate.py"
+SHINGLE_SIZE=8
+NUM_TREES=256
+PYTHON="/home/chenghao/miniconda3/envs/tooling/bin/python"
+SCRIPT="/home/chenghao/data_tooling/ac_dc/deduplicate.py"
 
 for lang in "${LANGUAGES[@]}"; do
     echo "lang: $lang"
@@ -14,12 +16,12 @@ for lang in "${LANGUAGES[@]}"; do
     echo "Hashing documents"
     for i in $(seq -f "%05g" 0 "$((SHARDS - 1))"); do
         echo "Hashing shard ${i}"
-        $PYTHON $SCRIPT build-hashes "cache/sharded_deduplicated_${lang}/hashes_${i}" --data-files "sharded_${i}.jsonl" --path "cache/sharded_deduplicated_${lang}" --split "train" --shingle-size 4
+        $PYTHON $SCRIPT build-hashes "cache/sharded_deduplicated_${lang}/hashes_${i}" --data-files "sharded_${i}.jsonl" --path "cache/sharded_deduplicated_${lang}" --split "train" --shingle-size $SHINGLE_SIZE
     done
 
     echo "Creating index"
-    $PYTHON $SCRIPT build-index "cache/sharded_deduplicated_${lang}/simhash_index.ann" $(seq -s " " -f "cache/sharded_deduplicated_${lang}/hashes_%05g" 0 "$((SHARDS - 1))") --split "train"
-
+    $PYTHON $SCRIPT build-index "cache/sharded_deduplicated_${lang}/simhash_index.ann" $(seq -s " " -f "cache/sharded_deduplicated_${lang}/hashes_%05g" 0 "$((SHARDS - 1))") --split "train" --num-trees $NUM_TREES
+    
     echo "Finding duplicates"
     for i in $(seq -f "%05g" 0 "$((SHARDS - 1))"); do
         echo "Querying shard ${i}"
