@@ -28,7 +28,7 @@ from simhash import Simhash
 from tqdm import tqdm
 
 # set_caching_enabled(False)
-datasets.config.IN_MEMORY_MAX_SIZE = 1024 * 1024 * 1024 * 512
+# datasets.config.IN_MEMORY_MAX_SIZE = 1024 * 1024 * 1024 * 512
 
 app = typer.Typer()
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
@@ -225,7 +225,7 @@ def build_hashes(
     """
     num_proc = check_num_proc(num_proc)
 
-    ds = load_dataset(path, name, data_dir=data_dir, data_files=data_files, use_auth_token=True, keep_in_memory=True)
+    ds = load_dataset(path, name, data_dir=data_dir, data_files=data_files, use_auth_token=True, keep_in_memory=False)
 
     logger.info("Done loading the dataset")
 
@@ -295,7 +295,7 @@ def build_index(
         return
 
     for dir in data_dirs:
-        ds = load_from_disk(dir, keep_in_memory=True)
+        ds = load_from_disk(dir, keep_in_memory=False)
         splits = [split] if split is not None else list(ds.keys())
         if split is None:
             logger.warning(
@@ -342,32 +342,36 @@ def gather_hashes(
     num_proc = check_num_proc(num_proc)
 
     if not os.path.exists(output_file):
-        manager = Manager()
-        hashes: List[Tuple[int, np.ndarray]] = manager.list()
+        hashes: List[Tuple[int, np.ndarray]] = []
 
-        def process(id, hash, text=None, meta=None):
-            hashes.append((int(id), hash))
-            return
-
-        for dir in data_dirs:
-            ds = load_from_disk(dir, keep_in_memory=True)
-            splits = [split] if split is not None else list(ds.keys())
+        if len(data_dirs) > 1:
+            for dir in data_dirs:
+                ds = load_from_disk(dir, keep_in_memory=False)
+                logger.info(f"Done loading {dir}")
+                splits = [split] if split is not None else list(ds.keys())
+                if split is None:
+                    logger.warning(
+                        f"Using all splits to build the index, please make sure the `id` is unique globally"
+                    )
+                for split in splits:
+                    hashes.extend(list(tqdm(zip(ds[split]["id"], ds[split]["hash"]))))
+            hashes = np.asarray([h[1] for h in sorted(hashes, key=lambda x: x[0])])
+        else:
+            dir = data_dirs[0]
+            ds = load_from_disk(dir, keep_in_memory=False)
+            logger.info(f"Done loading {dir}")
+            splits = [split] if split is not None else ["train"]
             if split is None:
                 logger.warning(
                     f"Using all splits to build the index, please make sure the `id` is unique globally"
                 )
             for split in splits:
-                with WorkerPool(n_jobs=num_proc) as pool:
-                    pool.map(
-                        process,
-                        ds[split],
-                        progress_bar=True,
-                    )
+                ds_sorted = ds[split].sort("id")
+                hashes = ds_sorted["hash"]
 
         # Caching hashes
         # sorting is necessary since the indexing assumes the order
         logger.info(f"Writing hashed to {output_file}...")
-        hashes = np.asarray([h[1] for h in sorted(list(hashes), key=lambda x: x[0])])
         with h5py.File(output_file, "w") as hf:
             hf.create_dataset("hashes", data=hashes)
 
@@ -430,7 +434,7 @@ def find_duplicates(
         return record
 
     for dir in data_dirs:
-        ds = load_from_disk(dir, keep_in_memory=True)
+        ds = load_from_disk(dir, keep_in_memory=False)
         splits = [split] if split is not None else list(ds.keys())
         for s in splits:
             with WorkerPool(n_jobs=num_proc, shared_objects=index) as pool:
@@ -485,7 +489,7 @@ def find_scann_duplicates(
         )
         .tree(
             num_leaves=int(math.sqrt(len(data))),
-            num_leaves_to_search=1000,
+            num_leaves_to_search=10,
             training_sample_size=int(0.1 * len(data)),
         )
         .score_ah(2, anisotropic_quantization_threshold=0.2)
@@ -510,9 +514,10 @@ def find_scann_duplicates(
         return record
 
     for dir in data_dirs:
-        ds = load_from_disk(dir, keep_in_memory=True)
+        ds = load_from_disk(dir, keep_in_memory=False)
         splits = [split] if split is not None else list(ds.keys())
         for s in splits:
+            # ds[s] = ds[s].map(process, num_proc=num_proc)
             with WorkerPool(n_jobs=num_proc, shared_objects=searcher) as pool:
                 results = pool.map(process, ds[s], progress_bar=True)
             ds[s] = Dataset.from_pandas(pd.DataFrame(results))
@@ -564,7 +569,7 @@ def remove_duplicates(
             edges.append((int(record["id"]), dup))
 
     for dir in data_dirs:
-        ds = load_from_disk(dir, keep_in_memory=True)
+        ds = load_from_disk(dir, keep_in_memory=False)
         splits = [split] if split is not None else list(ds.keys())
         for s in splits:
             ds[s].map(process, num_proc=num_proc)
@@ -579,7 +584,7 @@ def remove_duplicates(
         flags[c.pop()] = True
 
     for dir in data_dirs:
-        ds = load_from_disk(dir, keep_in_memory=True)
+        ds = load_from_disk(dir, keep_in_memory=False)
         splits = [split] if split is not None else list(ds.keys())
         for s in splits:
             ds[s] = ds[s].filter(lambda x: flags.get(int(x["id"]), True))
@@ -631,7 +636,7 @@ def merge_meta(
         meta_data[int(record["id"])] = record["meta"]
 
     for dir in meta_data_dirs:
-        ds = load_from_disk(dir, keep_in_memory=True)
+        ds = load_from_disk(dir, keep_in_memory=False)
         splits = [split] if split is not None else list(ds.keys())
         for s in splits:
             ds[s].map(process_meta, num_proc=num_proc)
@@ -668,7 +673,7 @@ def merge_meta(
         return {"meta": metadata}
 
     for dir in data_dirs:
-        ds = load_from_disk(dir, keep_in_memory=True)
+        ds = load_from_disk(dir, keep_in_memory=False)
         splits = [split] if split is not None else list(ds.keys())
         for s in splits:
             with WorkerPool(n_jobs=num_proc, shared_objects=index) as pool:
@@ -690,7 +695,7 @@ def merge_shards(
         os.makedirs(output_dir, exist_ok=True)
     ds = []
     for dir in data_dirs:
-        ds.append(load_from_disk(dir, keep_in_memory=True)[split])
+        ds.append(load_from_disk(dir, keep_in_memory=False)[split])
 
     DatasetDict({split: concatenate_datasets(ds)}).save_to_disk(output_dir)
 
