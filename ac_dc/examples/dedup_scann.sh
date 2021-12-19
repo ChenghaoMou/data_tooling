@@ -1,8 +1,8 @@
 #!/bin/bash
-LANGUAGES=('fr')
-SHARDS=1
+LANGUAGES=('en')
+SHARDS=4
 THRESHOLD=3
-SHINGLE_SIZE=8
+SHINGLE_SIZE=6
 NUM_TREES=256
 PYTHON="/home/chenghao/miniconda3/envs/py37/bin/python"
 SCRIPT="/home/chenghao/data_tooling/ac_dc/deduplicate.py"
@@ -23,8 +23,8 @@ for lang in "${LANGUAGES[@]}"; do
 
     # if [[ $SHARDS -ne 1 ]]
     # then
-    #     echo "Creating ${SHARDS} shards"
-    #     $PYTHON $SCRIPT create-shards "cache/sharded_deduplicated_${lang}" $SHARDS --path "oscar-corpus/OSCAR-2109" --name "deduplicated_${lang}" --split "train"
+    #     # echo "Creating ${SHARDS} shards"
+    #     # $PYTHON $SCRIPT create-shards "cache/sharded_deduplicated_${lang}" $SHARDS --path "oscar-corpus/OSCAR-2109" --name "deduplicated_${lang}" --split "train"
     #     echo "Hashing documents"
     #     for i in $(seq -f "%05g" 0 "$((SHARDS - 1))"); do
     #         echo "Hashing shard ${i}"
@@ -58,17 +58,14 @@ for lang in "${LANGUAGES[@]}"; do
     # │                                                                         │
     # │                                                                         │
     # └─────────────────────────────────────────────────────────────────────────┘
-    echo "Finding duplicates"
-    for i in $(seq -f "%05g" 0 "$((SHARDS - 1))"); do
-        echo "Querying shard ${i}"
-        $PYTHON -W ignore $SCRIPT find-scann-duplicates "cache/sharded_deduplicated_${lang}/hashes_${i}" "cache/sharded_deduplicated_${lang}/simhash_vectors.hdf5" --split "train" --k 50 --threshold $THRESHOLD
-    done
+    # echo "Finding duplicates"
+    # for i in $(seq -f "%05g" 0 "$((SHARDS - 1))"); do
+    #     echo "Querying shard ${i}"
+    #     $PYTHON -W ignore $SCRIPT find-scann-duplicates "cache/sharded_deduplicated_${lang}/hashes_${i}" "cache/sharded_deduplicated_${lang}/simhash_vectors.hdf5" --split "train" --k 50 --threshold $THRESHOLD
+    # done
 
     echo "Removing duplicates"
-    for i in $(seq -f "%05g" 0 "$((SHARDS - 1))"); do
-        echo "Cleaning shard ${i}"
-        $PYTHON $SCRIPT remove-duplicates "cache/sharded_deduplicated_${lang}/hashes_${i}_duplicates" --split "train"
-    done
+    $PYTHON $SCRIPT remove-duplicates $(seq -s " " -f "cache/sharded_deduplicated_${lang}/hashes_%05g_duplicates" 0 "$((SHARDS - 1))") "cache/sharded_deduplicated_${lang}/output" --split "train"
 
     echo "Merging shards"
     $PYTHON $SCRIPT merge-shards "cache/sharded_deduplicated_${lang}/output" $(seq -s " " -f "cache/sharded_deduplicated_${lang}/hashes_%05g_deduplicated" 0 "$((SHARDS - 1))") --split "train"

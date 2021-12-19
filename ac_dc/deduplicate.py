@@ -27,6 +27,8 @@ from mpire import WorkerPool
 from simhash import Simhash
 from tqdm import tqdm
 
+from datasets import Value
+
 # set_caching_enabled(False)
 # datasets.config.IN_MEMORY_MAX_SIZE = 1024 * 1024 * 1024 * 512
 
@@ -133,7 +135,10 @@ def create_shards(
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    ds = load_dataset(path, name, data_dir=data_dir, use_auth_token=True)
+    # ds = load_dataset(path, name, data_dir=data_dir, use_auth_token=True)
+    import gcsfs
+    gcs = gcsfs.GCSFileSystem(project='project-chenghao-mou')
+    ds = load_from_disk('project-chenghao-mou-bucket/filtered_tot',fs=gcs)
 
     def shard(
         ds,
@@ -441,7 +446,7 @@ def find_duplicates(
                 results = pool.map(process, ds[s], progress_bar=True)
             ds[s] = Dataset.from_pandas(pd.DataFrame(results))
             logger.info(
-                f"Found {len(ds[s].filter(lambda x: len(x['duplicates']) > 1))} duplicates in {dir}"
+                f"Found {len(ds[s].filter(lambda x: len(x['duplicates']) > 1), num_proc=num_proc)} duplicates in {dir}"
             )
 
         ds.save_to_disk(dir.rstrip("/") + "_duplicates")
@@ -506,6 +511,8 @@ def find_scann_duplicates(
             "duplicates": list(dups) if dups else [-1],
             "id": id,
             "hash": hash,
+            "neighbors": list(candidates[0]) if len(candidates[0]) else [-1],
+            "distances": list(map(int, candidates[1])) if len(candidates[1]) else [-1],
         }
         if meta is not None:
             record["meta"] = meta
@@ -522,7 +529,7 @@ def find_scann_duplicates(
                 results = pool.map(process, ds[s], progress_bar=True)
             ds[s] = Dataset.from_pandas(pd.DataFrame(results))
             logger.info(
-                f"Found {len(ds[s].filter(lambda x: len(x['duplicates']) > 1))} duplicates in {dir}"
+                f"Found {len(ds[s].filter(lambda x: len(x['duplicates']) > 1, num_proc=num_proc))} duplicates in {dir}"
             )
 
         ds.save_to_disk(dir.rstrip("/") + "_duplicates")
@@ -531,7 +538,8 @@ def find_scann_duplicates(
 @app.command()
 def remove_duplicates(
     data_dirs: List[str],
-    split: Optional[str] = typer.Option(None, help="Which split of the data to load"),
+    output_dir: str,
+    split: Optional[str] = typer.Option("train", help="Which split of the data to load"),
     num_proc: int = typer.Option(-1, help="Number of processes to use"),
 ):
     """
@@ -559,36 +567,63 @@ def remove_duplicates(
 
     # a and b are connected if they are duplicates
     G = nx.Graph()
-    manager = Manager()
-    edges = manager.list()
-
-    def process(record):
-        for dup in record["duplicates"]:
-            if int(record["id"]) == dup or dup == -1:
-                continue
-            edges.append((int(record["id"]), dup))
+    edges = []
+    id2idx = []
+    shards = []
 
     for dir in data_dirs:
         ds = load_from_disk(dir, keep_in_memory=False)
-        splits = [split] if split is not None else list(ds.keys())
-        for s in splits:
-            ds[s].map(process, num_proc=num_proc)
+        temp = ds[split].filter(lambda x: len(x["duplicates"]) > 1, num_proc=num_proc)
+        edges.extend(list(zip(temp["id"], temp["duplicates"])))
+        id2idx.extend(ds[split]["id"])
+        logger.info(
+            f"Found {len(edges)} duplicates so far"
+        )
+        shards.append(ds[split])
 
-    flags = defaultdict(lambda: False)
-    for x, y in tqdm(edges):
-        G.add_edge(x, y)
+    reserve = set()
+    id2idx = {id: i for i, id in enumerate(sorted(id2idx))}
+    idx2id = {i: id for id, i in id2idx.items()}
+
+    for id, duplicates in edges:
+        idx = id2idx[id]
+        for dup in duplicates:
+            if dup == idx:
+                continue
+            G.add_edge(idx, dup)
 
     for c in nx.connected_components(G):
-        for n in c:
-            flags[n] = False
-        flags[c.pop()] = True
+        reserve.add(idx2id[c.pop()])
 
-    for dir in data_dirs:
-        ds = load_from_disk(dir, keep_in_memory=False)
-        splits = [split] if split is not None else list(ds.keys())
-        for s in splits:
-            ds[s] = ds[s].filter(lambda x: flags.get(int(x["id"]), True))
-        ds.save_to_disk(dir.rstrip("/").replace("_duplicates", "_deduplicated"))
+    def process(idx2id, **kwargs):
+        kwargs["duplicates"] = [idx if idx == -1 else idx2id[idx] for idx in kwargs["duplicates"]]
+        # kwargs["neighbors"] = [idx if idx == -1 else idx2id[idx] for idx in kwargs["neighbors"]]
+        return kwargs
+    
+    def update_ids(record):
+        record["duplicates"] = [record["id"]]
+        return record
+
+    for i, (shard, dir) in enumerate(zip(shards, data_dirs)):
+        
+        logger.info(f"Processing shard {i} - {len(shard)}")
+        
+        non_duplicates = shard.filter(lambda x: len(x["duplicates"]) == 1, num_proc=num_proc)
+        non_duplicates = non_duplicates.map(update_ids, num_proc=num_proc)
+        logger.info(f"Processing shard {i} non-duplicates - {len(non_duplicates)}")
+
+        duplicates = shard.filter(lambda x: len(x["duplicates"]) > 1, num_proc=num_proc)
+        duplicates = duplicates.filter(lambda x: x["id"] in reserve, num_proc=num_proc)
+        logger.info(f"Processing shard {i} duplicates - {len(duplicates)}")
+        
+        with WorkerPool(n_jobs=num_proc, shared_objects=idx2id, keep_alive=False) as pool:
+            results = pool.imap_unordered(process, duplicates, progress_bar=True)
+        duplicates = Dataset.from_pandas(pd.DataFrame(results), features=shard.features)
+
+        shard = concatenate_datasets([non_duplicates, duplicates])
+        shard = shard.remove_columns(["distances", "neighbors"])
+        logger.info(f"Done processing shard {i} - {len(shard)}")
+        DatasetDict({split: shard}).save_to_disk(dir.rstrip("/").replace("_duplicates", "_deduplicated"))
 
 
 @app.command()
@@ -680,7 +715,7 @@ def merge_meta(
                 results = pool.map(merge, ds[s], progress_bar=True)
             ds[s] = Dataset.from_pandas(pd.DataFrame(results))
             logger.info(
-                f"Matched {len(ds[s].filter(lambda x: x['meta']['offset'] != -1))}/{len(ds[s])} records in {dir}"
+                f"Matched {len(ds[s].filter(lambda x: x['meta']['offset'] != -1, num_proc=num_proc))}/{len(ds[s])} records in {dir}"
             )
         ds.save_to_disk(dir.rstrip("/").replace("_duplicates", "_with_meta"))
 
